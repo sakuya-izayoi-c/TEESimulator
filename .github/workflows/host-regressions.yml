@@ -1,0 +1,27 @@
+name: Build 8 host regressions (tests only)
+on:
+  push:
+    branches: ['ci/build8-review-host-tests']
+permissions:
+  contents: read
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configuration transaction and early boot
+        run: TMPDIR="$RUNNER_TEMP" sh tests/host/run_early_boot.sh
+      - name: Input validation
+        run: cargo test --locked --manifest-path tests/host/der/Cargo.toml --lib
+      - name: Pinned reference TA unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth=1 -- third_party/keymint
+          for patch in "$PWD"/rust/patches/*.patch; do
+            git -C third_party/keymint apply "$patch"
+          done
+          cargo test --manifest-path third_party/keymint/Cargo.toml -p kmr-ta --lib
