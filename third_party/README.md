@@ -16,17 +16,21 @@ patches called out below.
 ## Build-time patches
 
 `rust/patches/` holds the delta between the reference TA as AOSP builds it and what we
-need it to be. Two patches are pure build plumbing, two adapt the TA to what an
-in-process simulator can honestly do, and one relaxes a rule that only holds on real
-hardware. None of them touch the crypto.
+need it to be. The active patches cover build integration and attestation encoding.
+User authentication and keyblob version binding use the reference implementation.
 
 | Patch | What it changes |
 |---|---|
 | `kmr-crypto-boring` | The crate is written to build under AOSP's **Soong** against `bssl-sys` (Soong's BoringSSL binding). We build under **Cargo** against `openssl-sys`, so this drops the `#[cfg(soong)]` paths and an `i32` key-length narrowing the `openssl-sys` binding doesn't need. |
 | `kmr-crypto-boring-ec-group` | Upstream parses an imported EC private key without naming its curve, which only works with Android's `rust-openssl` fork. Reaches for BoringSSL's group-aware entry point instead, so a SEC1 key that legally omits its parameters still parses — and one naming the wrong curve is rejected. |
 | `kmr-ta-seclevel` | Lets a single TA attest at the security level and `attestationVersion` of the HAL a request arrived through, so a dual-level device stays honest at both, and keeps pre-KeyMint (Keymaster) attestation versions representable. |
-| `kmr-ta-authtoken` | The auth token is MAC'd under the device's `ISharedSecret` key, which this TA never negotiates and so cannot verify. When there is no key to verify with, the token is trusted on presence; every other binding it carries is still enforced. |
-| `kmr-ta-restamp` | Upstream rejects a keyblob stamped *ahead* of the current patch level, because real hardware only ever moves forward. Ours is a configured value the user can lower again, which would strand every key minted under the higher setting, so the blob is re-stamped in whichever direction is needed. |
+| `kmr-ta-versioned-rot` | Restricts the local extension encoder to its supported wire formats. |
+
+The earlier exceptions for unverifiable auth-token MACs and downward keyblob
+re-stamping were removed. A profile with a lower patch level cannot reopen a
+keyblob bound to a higher level by relabeling it. `rust/verify-stock-security.sh`
+checks the three security-critical source files before compilation; if an old
+patched tree fails this check, preserve any local edits and use a clean checkout.
 
 `rust/build.sh` applies them to the `keymint` submodule's **working tree** at build
 time, idempotently: each is reverse-checked first (`git apply --reverse --check`) and

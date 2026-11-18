@@ -1,28 +1,27 @@
 // Device trait implementations for the software TA.
 //
-// The root key material is fixed, which is what makes the derived key-encryption
-// keys reproducible across restarts. Remote key provisioning is not intercepted,
-// so its artifacts only need to exist.
+// There is no trusted root-key backend. Operations that require one must fail;
+// in particular, do not fall back to an old software root to open a keyblob.
 
 use kmr_common::crypto::{self, mldsa, AccumulatingOperation, Hkdf, MlDsa, OpaqueOr};
-use kmr_common::{km_err, Error};
+use kmr_common::{km_err, rpc_err, Error};
 use kmr_ta::device::{
     DiceInfo, RetrieveAttestationIds, RetrieveKeyMaterial, RetrieveRpcArtifacts, RpcV2Req,
 };
 use kmr_wire::types::AttestationIdInfo;
 
-/// Fixed root key material.
+/// No device root material is provisioned for the software TA.
 pub struct Keys;
 
 impl RetrieveKeyMaterial for Keys {
     fn root_kek(&self, _context: &[u8]) -> Result<crypto::OpaqueOr<crypto::hmac::Key>, Error> {
-        Ok(crypto::hmac::Key::new([0; 16].to_vec()).into())
+        Err(km_err!(HardwareTypeUnavailable, "no trusted root KEK backend"))
     }
     fn kak(&self) -> Result<crypto::OpaqueOr<crypto::aes::Key>, Error> {
-        Ok(crypto::aes::Key::Aes256([0; 32]).into())
+        Err(km_err!(HardwareTypeUnavailable, "no trusted KAK backend"))
     }
     fn unique_id_hbk(&self, _ckdf: &dyn crypto::Ckdf) -> Result<crypto::hmac::Key, Error> {
-        crypto::hmac::Key::new_from(b"MustBeRandomBits")
+        Err(km_err!(HardwareTypeUnavailable, "no trusted unique-ID HBK backend"))
     }
 }
 
@@ -56,19 +55,17 @@ pub fn realtime_ms_since_epoch() -> i64 {
     (time.tv_sec * 1000) + (time.tv_nsec / 1_000_000)
 }
 
-/// Stub remote-provisioning artifacts. The interceptor never routes
-/// IRemotelyProvisionedComponent calls here, so only `derive_bytes_from_hbk`
-/// needs to work (and only to be deterministic).
+/// No remote-provisioning backend. The default RPC MAC also needs this HBK.
 pub struct NoRpc;
 
 impl RetrieveRpcArtifacts for NoRpc {
     fn derive_bytes_from_hbk(
         &self,
-        hkdf: &dyn Hkdf,
-        context: &[u8],
-        output_len: usize,
+        _hkdf: &dyn Hkdf,
+        _context: &[u8],
+        _output_len: usize,
     ) -> Result<Vec<u8>, Error> {
-        hkdf.hkdf(&[], b"teesim-rpc-hbk", context, output_len)
+        Err(rpc_err!(Failed, "no trusted RPC HBK backend"))
     }
 
     fn get_dice_info(&self, _test_mode: kmr_wire::rpc::TestMode) -> Result<DiceInfo, Error> {
@@ -115,5 +112,74 @@ impl MlDsa for NoMlDsa {
         _key: OpaqueOr<mldsa::Key>,
     ) -> Result<Box<dyn AccumulatingOperation>, Error> {
         Err(km_err!(Unimplemented, "ML-DSA is not supported"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmr_common::ErrorKind;
+    use kmr_wire::keymint::ErrorCode;
+
+    fn assert_no_root<T>(result: Result<T, Error>) {
+        assert!(matches!(
+            result.err().as_ref().map(Error::kind),
+            Some(ErrorKind::Hal(ErrorCode::HardwareTypeUnavailable, _))
+        ));
+    }
+
+    #[test]
+    fn root_kek_refuses_any_blob_context() {
+        let keys: &dyn RetrieveKeyMaterial = &Keys;
+        for context in [&[][..], b"stored context"] {
+            assert_no_root(keys.root_kek(context));
+        }
+    }
+
+    #[test]
+    fn kak_refuses_shared_secret_negotiation_key() {
+        let keys: &dyn RetrieveKeyMaterial = &Keys;
+        assert_no_root(keys.kak());
+    }
+
+    #[test]
+    fn unique_id_refuses_hbk() {
+        let keys: &dyn RetrieveKeyMaterial = &Keys;
+        assert_no_root(keys.unique_id_hbk(&crypto::NoOpAesCmac));
+    }
+
+    // The AOSP blanket HKDF implementation uses HMAC. Neither HKDF nor the
+    // default RPC MAC path should reach a cryptographic operation without an HBK.
+    struct UnexpectedHmac;
+
+    impl crypto::Hmac for UnexpectedHmac {
+        fn begin(
+            &self,
+            _key: OpaqueOr<crypto::hmac::Key>,
+            _digest: kmr_wire::keymint::Digest,
+        ) -> Result<Box<dyn AccumulatingOperation>, Error> {
+            panic!("RPC used HMAC without a trusted HBK");
+        }
+    }
+
+    fn assert_no_rpc_hbk(result: Result<Vec<u8>, Error>) {
+        assert!(matches!(
+            result.err().as_ref().map(Error::kind),
+            Some(ErrorKind::Rpc(kmr_wire::rpc::ErrorCode::Failed, _))
+        ));
+    }
+
+    #[test]
+    fn rpc_refuses_hbk_derivation() {
+        let rpc: &dyn RetrieveRpcArtifacts = &NoRpc;
+        for (context, len) in [(&[][..], 0), (b"context", 32)] {
+            assert_no_rpc_hbk(rpc.derive_bytes_from_hbk(&UnexpectedHmac, context, len));
+        }
+    }
+
+    #[test]
+    fn rpc_default_mac_propagates_missing_hbk() {
+        let rpc: &dyn RetrieveRpcArtifacts = &NoRpc;
+        assert_no_rpc_hbk(rpc.compute_hmac_sha256(&UnexpectedHmac, &UnexpectedHmac, b"input"));
     }
 }
