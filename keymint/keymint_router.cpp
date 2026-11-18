@@ -11,6 +11,7 @@
 #include <aidl/android/hardware/security/keymint/BnKeyMintDevice.h>
 #include <aidl/android/hardware/security/keymint/BnKeyMintOperation.h>
 #include <android/binder_ibinder.h>  // AIBinder_getCallingUid / AIBinder_getCallingPid
+#include <sys/system_properties.h>   // __system_property_get for the late-load boot check
 #include <unistd.h>                       // getuid / getpid
 
 #include <atomic>
@@ -91,6 +92,17 @@ std::vector<Profile> g_profiles;
 // failing while the daemon has not pushed a config yet; see WaitForDefaultTa.
 std::condition_variable g_cfg_cv;
 bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else StrongBox forces generation
+// Whether the device has left early boot: set when keystore2 delivers its (one-shot) earlyBootEnded()
+// signal, and re-derived from sys.boot_completed for a TA built later — with late-load the module can
+// be injected after that call has already gone by, so the signal alone is not enough.
+std::atomic<bool> g_early_boot_ended{false};
+
+// True when the system reports boot completed; a fallback for the late-load case, where the
+// earlyBootEnded() signal was delivered before this process existed.
+static bool BootCompleted() {
+  char value[PROP_VALUE_MAX] = {};
+  return __system_property_get("sys.boot_completed", value) > 0 && value[0] == '1';
+}
 // The device-wide MODULE_HASH to seed a freshly built TA with, so a generation-mode key carries the
 // tag keystore2 only sends once per boot (and never resends to a TA built afterwards). Preference:
 // the exact bytes keystore2 pushed via setAdditionalAttestationInfo, captured below; the daemon's own
@@ -1375,6 +1387,9 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LogContext lc_(RequestCtx());
     // Latch end-of-early-boot on our keys too, so an EARLY_BOOT_ONLY key we minted stops working at
     // the same point keystore2 signals the real HAL. Best-effort: a TA that rejects is only logged.
+    // Recorded before the fan-out: teesim_cfg_add_profile replays it onto any TA it builds later,
+    // since the signal itself is one-shot and reaches only the TAs alive right now.
+    g_early_boot_ended.store(true);
     for (const auto& ta : AllProfileTas()) {
       int32_t rc = teesim_km_early_boot_ended(ta.get());
       if (rc != 0) LOGW("earlyBootEnded: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
@@ -1653,6 +1668,18 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
     }
     SeedModuleHash(prof.ta_tee, seed);
     SeedModuleHash(prof.ta_strongbox, seed);
+  }
+  // Replay the end-of-early-boot latch onto a TA that was built after the signal — or, under
+  // late-load, after the signal had already gone by before this process was injected. Same late-TA
+  // gap the MODULE_HASH seed above closes; without it a profile that goes live post-boot would keep
+  // EARLY_BOOT_ONLY usable.
+  if (g_early_boot_ended.load() || BootCompleted()) {
+    for (const TaPtr& ta : {prof.ta_tee, prof.ta_strongbox}) {
+      int32_t rc = teesim_km_early_boot_ended(ta.get());
+      if (rc != 0)
+        LOGW("teesim_cfg_add_profile: early_boot_ended replay rejected rc=%d(%s)", rc,
+             teesim_km_err_name(rc));
+    }
   }
   for (int i = 0; i < p->n_packages && p->packages; ++i) {
     if (!p->packages[i]) continue;
