@@ -66,6 +66,25 @@ impl Ta {
     /// generateKey. The returned key blob carries our marker. This TA instance is fixed at one
     /// security level, so the record's `attestationSecurityLevel` and version come from the instance
     /// the request was routed to — no per-request override.
+    /// Rewrite a leaf that declares a pre-v4 `keymasterVersion` so its RootOfTrust has the
+    /// three-element shape that version defines instead of the four-element one generation emits.
+    /// The leaf arrives already signed by the keybox, so the rewrite re-signs it exactly as patch
+    /// mode does; every other field is preserved.
+    fn normalise_root_of_trust(&self, chain: &mut [kmr_wire::keymint::Certificate]) {
+        let Some(leaf) = chain.first().map(|c| c.encoded_certificate.clone()) else { return };
+        if crate::resign::leaf_keymaster_version(&leaf) >= 4 {
+            return;
+        }
+        match self.patch_attestation(&leaf) {
+            Ok(patched) => {
+                if let Some(new_leaf) = patched.first() {
+                    chain[0].encoded_certificate = new_leaf.clone();
+                }
+            }
+            Err(e) => log::warn!("root-of-trust normalisation failed: {} ({})", e.msg, e.code),
+        }
+    }
+
     pub fn generate_key(
         &mut self,
         mut key_params: Vec<KeyParam>,
@@ -79,7 +98,8 @@ impl Ta {
         ensure_creation_datetime(&mut key_params);
         let resp: Result<GenerateKeyResponse, OpError> =
             self.perform(GenerateKeyRequest { key_params, attestation_key });
-        let ret = resp?.ret;
+        let mut ret = resp?.ret;
+        self.normalise_root_of_trust(&mut ret.certificate_chain);
         crate::resign::log_chain("generate_key result", &ret.certificate_chain);
         Ok(marked_result(ret))
     }
@@ -103,7 +123,8 @@ impl Ta {
         ensure_creation_datetime(&mut key_params);
         let resp: Result<ImportKeyResponse, OpError> =
             self.perform(ImportKeyRequest { key_params, key_format, key_data, attestation_key });
-        let ret = resp?.ret;
+        let mut ret = resp?.ret;
+        self.normalise_root_of_trust(&mut ret.certificate_chain);
         crate::resign::log_chain("import_key result", &ret.certificate_chain);
         Ok(marked_result(ret))
     }
