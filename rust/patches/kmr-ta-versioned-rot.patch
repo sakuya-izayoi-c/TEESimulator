@@ -1,18 +1,15 @@
 --- a/ta/src/cert.rs
 +++ b/ta/src/cert.rs
-@@ -365,7 +365,10 @@
+@@ -365,7 +365,7 @@
          hw_chars,
          hw_params,
          attestation_ids,
 -        Some(RootOfTrust::from(boot_info)),
-+        Some(
-+            encode_root_of_trust(boot_info, attestation_version)
-+                .map_err(|e| der_err!(e, "failed to encode RoT"))?,
-+        ),
++        Some(encode_root_of_trust(boot_info, attestation_version)?),
          None,
          &[],
      )?;
-@@ -603,7 +606,9 @@
+@@ -603,7 +603,9 @@
          auths: &'a [KeyParam],
          keygen_params: &'a [KeyParam],
          attestation_ids: Option<&crate::AttestationIdInfo>,
@@ -23,7 +20,7 @@
          app_id: Option<&'a [u8]>,
          additional_attestation_info: &'a [KeyParam],
      ) -> Result<Self, Error> {
-@@ -614,11 +619,7 @@
+@@ -614,11 +616,7 @@
                  Some(attestation_ids) => requested_ids.check_match(attestation_ids)?,
              }
          }
@@ -36,14 +33,13 @@
          let module_hash = get_opt_tag_value!(additional_attestation_info, ModuleHash)?;
          Ok(Self {
              auths: auths.into(),
-@@ -1104,12 +1105,28 @@
+@@ -1104,12 +1102,27 @@
      }
  }
  
 +/// A RootOfTrust that is already DER-encoded, emitted verbatim.
 +///
-+/// Decoding it back into `RootOfTrust` and re-encoding would force the four-element shape, which a
-+/// record declaring a pre-v4 version must not carry (see `encode_root_of_trust`).
++/// The concrete schema was checked at construction (see `encode_root_of_trust`).
 +struct EncodedRootOfTrust<'a>(&'a [u8]);
 +
 +impl der::Encode for EncodedRootOfTrust<'_> {
@@ -67,15 +63,13 @@
          None => Ok(None),
      }
  }
-@@ -1334,6 +1351,40 @@
+@@ -1334,6 +1347,46 @@
      verified_boot_hash: &'a [u8],
  }
  
-+/// Root of Trust as a record that predates KeyMint 4 carries it: the three-element form.
-+/// `verifiedBootHash` arrived with that version, and a record that declares an older version while
-+/// carrying the fourth element is structurally inconsistent, whatever the element's value.
++/// Three-field legacy record. This is not the schema for all releases before KeyMint 4.
 +#[derive(Debug, Clone, Sequence)]
-+struct RootOfTrustV3<'a> {
++struct LegacyRootOfTrust<'a> {
 +    #[asn1(type = "OCTET STRING")]
 +    verified_boot_key: &'a [u8],
 +    device_locked: bool,
@@ -86,9 +80,16 @@
 +fn encode_root_of_trust(
 +    boot_info: &keymint::BootInfo,
 +    attestation_version: i32,
-+) -> der::Result<Vec<u8>> {
-+    if attestation_version >= 400 {
-+        return RootOfTrust::from(boot_info).to_der();
++) -> Result<Vec<u8>, Error> {
++    // Do not guess a wire format. Only retain versions for which the existing encoder's
++    // shape and version pair agree with the published schema; do not assume future versions.
++    match attestation_version {
++        400 | 500 => {
++            return RootOfTrust::from(boot_info).to_der()
++                .map_err(|e| der_err!(e, "failed to encode RoT"));
++        }
++        2 => {}
++        other => return Err(km_err!(Unimplemented, "unsupported attestation schema {other}")),
 +    }
 +    let verified_boot_key: &[u8] = if boot_info.verified_boot_key.is_empty() {
 +        // If an empty verified boot key was passed by the boot loader, set the verified boot
@@ -97,18 +98,50 @@
 +    } else {
 +        &boot_info.verified_boot_key[..]
 +    };
-+    RootOfTrustV3 {
++    LegacyRootOfTrust {
 +        verified_boot_key,
 +        device_locked: boot_info.device_boot_locked,
 +        verified_boot_state: boot_info.verified_boot_state.into(),
 +    }
 +    .to_der()
++    .map_err(|e| der_err!(e, "failed to encode RoT"))
 +}
 +
  impl<'a> From<&'a keymint::BootInfo> for RootOfTrust<'a> {
      fn from(info: &keymint::BootInfo) -> RootOfTrust<'_> {
          let verified_boot_key: &[u8] = if info.verified_boot_key.is_empty() {
-@@ -1407,7 +1458,7 @@
+@@ -1390,3 +1443,30 @@
++    #[test]
++    fn schema_support_is_explicit() {
++        let boot = keymint::BootInfo {
++            verified_boot_key: vec![],
++            device_boot_locked: false,
++            verified_boot_state: keymint::VerifiedBootState::Unverified,
++            verified_boot_hash: vec![],
++            boot_patchlevel: 0,
++        };
++        let unique_id = vec![];
++        let make_extension = |version| attestation_extension(
++            version, b"test", &[], keymint::SecurityLevel::Software, None, &[], &[],
++            &unique_id, &boot, &[],
++        );
++        for version in [2, 400, 500] {
++            assert!(make_extension(version).is_ok(), "supported schema {version}");
++        }
++        for version in [-1, 0, 1, 3, 4, 99, 100, 200, 300, 401, 501, i32::MAX] {
++            let result = make_extension(version);
++            assert!(
++                matches!(result.as_ref().err().map(|e| e.kind()),
++                    Some(ErrorKind::Hal(keymint::ErrorCode::Unimplemented, _))),
++                "unsupported schema {version} must not produce an extension",
++            );
++        }
++    }
++
+     #[test]
+     fn test_attest_ext_encode_decode() {
+         let sec_level = SecurityLevel::TrustedEnvironment;
+@@ -1407,7 +1487,7 @@
                      device_locked: false,
                      verified_boot_state: VerifiedBootState::Unverified,
                      verified_boot_hash: &[0xee; 32],
@@ -117,7 +150,7 @@
                  None,
                  &[],
              )
-@@ -1494,7 +1545,7 @@
+@@ -1494,7 +1574,7 @@
                  device_locked: false,
                  verified_boot_state: VerifiedBootState::Unverified,
                  verified_boot_hash: &[0xee; 32],
@@ -126,7 +159,7 @@
              None,
              &additional_attestation_info,
          )
-@@ -1549,7 +1600,7 @@
+@@ -1549,7 +1629,7 @@
                  device_locked: false,
                  verified_boot_state: VerifiedBootState::Unverified,
                  verified_boot_hash: &[0xee; 32],
@@ -135,7 +168,7 @@
              None,
              &[],
          )
-@@ -1618,7 +1669,7 @@
+@@ -1618,7 +1698,7 @@
                  device_locked: false,
                  verified_boot_state: VerifiedBootState::Unverified,
                  verified_boot_hash: &[0xee; 32],
@@ -144,7 +177,7 @@
              None,
              &[],
          )
-@@ -1643,7 +1694,7 @@
+@@ -1643,7 +1723,7 @@
                  device_locked: false,
                  verified_boot_state: VerifiedBootState::Unverified,
                  verified_boot_hash: &[0xee; 32],
@@ -153,7 +186,7 @@
              None,
              &[],
          )
-@@ -1664,7 +1715,7 @@
+@@ -1664,7 +1744,7 @@
                  device_locked: false,
                  verified_boot_state: VerifiedBootState::Unverified,
                  verified_boot_hash: &[0xee; 32],

@@ -182,17 +182,11 @@ bool FillDeviceIds(const tjson::Value &obj, ProfileStorage &s) {
            s.manufacturer.empty() && s.model.empty());
 }
 
-// Apply one parsed "config" message. Writes the ack counts through the outparams.
-void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &total) {
+// Return the commit result, not the number of successfully staged profiles.
+int ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &total) {
   epoch = 0;
-  applied = 0;
   total = 0;
   if (const tjson::Value *e = msg.get("epoch")) epoch = static_cast<uint64_t>(e->as_int(0));
-  if (const tjson::Value *s = msg.get("redactSalt")) {
-    std::vector<uint8_t> salt;
-    Base64Decode(s->as_string(), salt);
-    RedactSetSalt(salt.data(), salt.size());
-  }
 
   // Device-wide boot info.
   std::vector<uint8_t> vb_key, vb_hash, module_hash;
@@ -236,7 +230,6 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
       if (!name.empty()) rkp_deleted.push_back(name);
     }
   for (const auto &s : rkp_deleted) rkp_deleted_ptrs.push_back(s.c_str());
-  teesim_cfg_set_rkp_deleted(rkp_deleted_ptrs.data(), rkp_deleted_ptrs.size());
 
   const tjson::Value *profiles = msg.get("profiles");
   if (profiles && profiles->is_array()) {
@@ -311,12 +304,23 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
       tp.verified_boot_hash = s.vb_hash.empty() ? nullptr : s.vb_hash.data();
       tp.verified_boot_hash_len = s.vb_hash.size();
 
-      if (teesim_cfg_add_profile(&tp)) ++applied;
+      teesim_cfg_add_profile(&tp);  // Individual build failures are skipped by the staging API.
     }
   }
   char err[128] = {0};
   int committed = teesim_cfg_commit(epoch, err, sizeof(err));
-  if (committed < 0) LOGE("ApplyConfig: commit failed: %s", err);
+  if (committed < 0) {
+    LOGE("ApplyConfig: commit epoch=%llu failed: %s", static_cast<unsigned long long>(epoch), err);
+    return committed;
+  }
+  // These setters change live state. A rejected generation must not install either value.
+  teesim_cfg_set_rkp_deleted(rkp_deleted_ptrs.data(), rkp_deleted_ptrs.size());
+  if (const tjson::Value *s = msg.get("redactSalt")) {
+    std::vector<uint8_t> salt;
+    Base64Decode(s->as_string(), salt);
+    RedactSetSalt(salt.data(), salt.size());
+  }
+  return committed;
 }
 
 std::string BuildHello() {
@@ -330,10 +334,12 @@ std::string BuildHello() {
   return s;
 }
 
-std::string BuildAck(uint64_t epoch, int applied, int total) {
+std::string BuildAck(uint64_t epoch, int committed, int total) {
+  const int applied = committed < 0 ? 0 : committed;
   std::string s = "{\"type\":\"ack\",\"epoch\":";
   s += std::to_string(epoch);
-  s += ",\"ok\":true,\"profilesApplied\":";
+  s += committed < 0 ? ",\"ok\":false" : ",\"ok\":true";
+  s += ",\"profilesApplied\":";
   s += std::to_string(applied);
   s += ",\"profilesFailed\":";
   s += std::to_string(total - applied);
@@ -364,11 +370,12 @@ void HandleConnection(int fd) {
     std::string t = type ? type->as_string() : std::string();
     if (t == "config") {
       uint64_t epoch = 0;
-      int applied = 0, total = 0;
-      ApplyConfig(msg, epoch, applied, total);
-      WriteFrame(fd, BuildAck(epoch, applied, total));
-      LOGI("HandleConnection: applied config epoch=%llu profiles=%d/%d",
-           static_cast<unsigned long long>(epoch), applied, total);
+      int total = 0;
+      int committed = ApplyConfig(msg, epoch, total);
+      WriteFrame(fd, BuildAck(epoch, committed, total));
+      if (committed >= 0)
+        LOGI("HandleConnection: applied config epoch=%llu profiles=%d/%d",
+             static_cast<unsigned long long>(epoch), committed, total);
     } else if (t == "resign") {
       // Re-sign one existing key's attestation leaf under its profile's keybox. The daemon sends the
       // leaf and the owning profile id; we return the patched chain (base64 DER per cert) for it to

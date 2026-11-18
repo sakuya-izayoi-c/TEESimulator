@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "control.h"
+#include "early_boot_publication.h"
 #include "keymint_hook.h"
 #include "km_names.h"
 // The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
@@ -92,10 +93,7 @@ std::vector<Profile> g_profiles;
 // failing while the daemon has not pushed a config yet; see WaitForDefaultTa.
 std::condition_variable g_cfg_cv;
 bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else StrongBox forces generation
-// Whether the device has left early boot: set when keystore2 delivers its (one-shot) earlyBootEnded()
-// signal, and re-derived from sys.boot_completed for a TA built later — with late-load the module can
-// be injected after that call has already gone by, so the signal alone is not enough.
-std::atomic<bool> g_early_boot_ended{false};
+teesim::EarlyBootPublication g_early_boot{g_cfg_mu};
 
 // True when the system reports boot completed; a fallback for the late-load case, where the
 // earlyBootEnded() signal was delivered before this process existed.
@@ -344,8 +342,7 @@ TaPtr WaitForDefaultTa(SecurityLevel level) {
 // A snapshot of every configured profile's TA, for device-state transitions (earlyBootEnded /
 // setAdditionalAttestationInfo) that must reach all our keys, not just the default profile. The list
 // is copied under the config lock so the calls themselves run unlocked.
-std::vector<TaPtr> AllProfileTas() {
-  std::lock_guard<std::mutex> lk(g_cfg_mu);
+std::vector<TaPtr> AllProfileTasLocked() {
   std::vector<TaPtr> tas;
   tas.reserve(g_profiles.size() * 2);
   for (const auto& p : g_profiles) {
@@ -353,6 +350,11 @@ std::vector<TaPtr> AllProfileTas() {
     if (p.ta_strongbox) tas.push_back(p.ta_strongbox);
   }
   return tas;
+}
+
+std::vector<TaPtr> AllProfileTas() {
+  std::lock_guard<std::mutex> lk(g_cfg_mu);
+  return AllProfileTasLocked();
 }
 
 // Record `hash` on `ta` as Tag::MODULE_HASH so a generation-mode key it mints carries the module
@@ -1387,10 +1389,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
     LogContext lc_(RequestCtx());
     // Latch end-of-early-boot on our keys too, so an EARLY_BOOT_ONLY key we minted stops working at
     // the same point keystore2 signals the real HAL. Best-effort: a TA that rejects is only logged.
-    // Recorded before the fan-out: teesim_cfg_add_profile replays it onto any TA it builds later,
-    // since the signal itself is one-shot and reaches only the TAs alive right now.
-    g_early_boot_ended.store(true);
-    for (const auto& ta : AllProfileTas()) {
+    // Snapshot when latching. A generation published afterwards must pass commit-time replay.
+    for (const auto& ta : g_early_boot.EndAndSnapshot(AllProfileTasLocked)) {
       int32_t rc = teesim_km_early_boot_ended(ta.get());
       if (rc != 0) LOGW("earlyBootEnded: TA rejected rc=%d(%s)", rc, teesim_km_err_name(rc));
     }
@@ -1669,18 +1669,6 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
     SeedModuleHash(prof.ta_tee, seed);
     SeedModuleHash(prof.ta_strongbox, seed);
   }
-  // Replay the end-of-early-boot latch onto a TA that was built after the signal — or, under
-  // late-load, after the signal had already gone by before this process was injected. Same late-TA
-  // gap the MODULE_HASH seed above closes; without it a profile that goes live post-boot would keep
-  // EARLY_BOOT_ONLY usable.
-  if (g_early_boot_ended.load() || BootCompleted()) {
-    for (const TaPtr& ta : {prof.ta_tee, prof.ta_strongbox}) {
-      int32_t rc = teesim_km_early_boot_ended(ta.get());
-      if (rc != 0)
-        LOGW("teesim_cfg_add_profile: early_boot_ended replay rejected rc=%d(%s)", rc,
-             teesim_km_err_name(rc));
-    }
-  }
   for (int i = 0; i < p->n_packages && p->packages; ++i) {
     if (!p->packages[i]) continue;
     // No package_users[] at all means an older daemon that only ever targeted the primary user.
@@ -1705,15 +1693,17 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
   return true;
 }
 
-extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err_len*/) {
-  int n = 0;
-  {
-    std::lock_guard<std::mutex> lk(g_cfg_mu);
-    g_profiles = std::move(g_staging);
-    g_staging.clear();
-    g_strongbox_ok = g_stage_strongbox_ok;
-    n = static_cast<int>(g_profiles.size());
-  }
+extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* err, size_t err_len) {
+  auto end_ta = [&](const TaPtr& ta) {
+    const int32_t rc = teesim_km_early_boot_ended(ta.get());
+    if (rc == 0) return true;
+    if (err && err_len)
+      snprintf(err, err_len, "early boot replay rejected: rc=%d(%s)", rc, teesim_km_err_name(rc));
+    return false;
+  };
+  const int n = g_early_boot.Commit(g_profiles, std::move(g_staging), BootCompleted, end_ta,
+                                   [] { g_strongbox_ok = g_stage_strongbox_ok; });
+  if (n < 0) return n;
   // Release anything parked in WaitForDefaultTa now that there is a TA to serve it.
   g_cfg_cv.notify_all();
   return n;

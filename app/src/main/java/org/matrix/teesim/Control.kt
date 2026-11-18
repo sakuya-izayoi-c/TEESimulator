@@ -238,6 +238,10 @@ object Control {
                 )
             }
             "ack" -> {
+                if (!msg.optBoolean("ok")) {
+                    SystemLogger.warning("Control: config epoch=${msg.optLong("epoch")} not committed")
+                    return
+                }
                 SystemLogger.info(
                     "Control: ack epoch=${msg.optLong("epoch")} ok=${msg.optBoolean("ok")} " +
                         "applied=${msg.optInt("profilesApplied")} failed=${msg.optInt("profilesFailed")}"

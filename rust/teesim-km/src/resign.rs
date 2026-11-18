@@ -25,35 +25,11 @@ use x509_cert::der::{Decode, Encode};
 use x509_cert::spki::AlgorithmIdentifierOwned;
 use x509_cert::Certificate;
 
+mod input;
+use input::{parse_key_description, KeyDescription};
+
 /// Local (non-TA) failure code, matching `ops::ERR_UNKNOWN`.
 const ERR: i32 = -1000;
-
-/// `keymasterVersion` — field 2 of a DER `KeyDescription` — or 0 when it cannot be read.
-pub(crate) fn keymaster_version(key_desc: &[u8]) -> u32 {
-    let Ok(top) = read_elem(key_desc) else { return 0 };
-    if top.tag != [0x30] {
-        return 0;
-    }
-    let Ok(fields) = split_elems(top.value) else { return 0 };
-    let Some(field) = fields.get(2) else { return 0 };
-    let Ok(elem) = read_elem(field) else { return 0 };
-    let mut value: u32 = 0;
-    for byte in elem.value {
-        value = (value << 8) | u32::from(*byte);
-    }
-    value
-}
-
-/// `keymasterVersion` declared inside a leaf's KeyMint attestation extension, 0 when absent.
-pub(crate) fn leaf_keymaster_version(leaf: &[u8]) -> u32 {
-    let Ok(cert) = Certificate::from_der(leaf) else { return 0 };
-    cert.tbs_certificate
-        .extensions
-        .as_ref()
-        .and_then(|exts| exts.iter().find(|e| e.extn_id == ATTESTATION_EXT_OID))
-        .map(|e| keymaster_version(e.extn_value.as_bytes()))
-        .unwrap_or(0)
-}
 
 /// One-line description of a DER certificate, for logs. Best effort.
 ///
@@ -62,18 +38,20 @@ pub(crate) fn leaf_keymaster_version(leaf: &[u8]) -> u32 {
 /// identical lines. Both fields are already parsed into `tbs_certificate`, so they cost nothing.
 pub(crate) fn describe_cert(der: &[u8]) -> String {
     match Certificate::from_der(der) {
-        Ok(c) => {
-            let spki = c.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
-            format!(
-                "serial={} spki={} subject=[{}] issuer=[{}]",
-                short_hex(c.tbs_certificate.serial_number.as_bytes()),
-                short_hex(spki),
-                c.tbs_certificate.subject,
-                c.tbs_certificate.issuer
-            )
-        }
+        Ok(c) => describe_parsed_cert(&c),
         Err(e) => format!("<unparseable {}-byte cert: {e}>", der.len()),
     }
+}
+
+fn describe_parsed_cert(c: &Certificate) -> String {
+    let spki = c.tbs_certificate.subject_public_key_info.subject_public_key.raw_bytes();
+    format!(
+        "serial={} spki={} subject=[{}] issuer=[{}]",
+        short_hex(c.tbs_certificate.serial_number.as_bytes()),
+        short_hex(spki),
+        c.tbs_certificate.subject,
+        c.tbs_certificate.issuer
+    )
 }
 
 /// 64-bit FNV-1a, for naming a keybox in the log without printing any of it.
@@ -137,8 +115,8 @@ impl Ta {
     /// Re-sign a real hardware attestation `leaf` (DER) under the keybox with the profile's root of
     /// trust. Returns the new chain `[patched leaf, keybox chain…]`.
     pub fn patch_attestation(&self, leaf: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
-        log::debug!("patch_attestation: input leaf {}", describe_cert(leaf));
         let cert = Certificate::from_der(leaf).map_err(wrap("parse real leaf"))?;
+        log::debug!("patch_attestation: input leaf {}", describe_parsed_cert(&cert));
         let mut tbs = cert.tbs_certificate;
 
         // Sign with the keybox key matching the attested key's algorithm; batch() falls back to the
@@ -166,7 +144,9 @@ impl Ta {
             .ok_or_else(|| err("leaf has no KeyMint attestation extension"))?;
         // The RootOfTrust shape follows the record's own keymasterVersion: a v3 leaf carries the
         // three-element form, a v4+ leaf the four-element form with verifiedBootHash.
-        let root_of_trust: &[u8] = if leaf_keymaster_version(leaf) >= 4 {
+        let description =
+            parse_key_description(ext.extn_value.as_bytes()).map_err(wrap("parse key description"))?;
+        let root_of_trust: &[u8] = if description.keymaster_version >= 4 {
             &self.patch_rot
         } else {
             &self.patch_rot_no_hash
@@ -179,7 +159,7 @@ impl Ta {
             boot_patchlevel: self.boot_patchlevel,
             attestation_ids: self.attestation_ids.as_ref(),
         };
-        let patched = patch_key_description(ext.extn_value.as_bytes(), &overrides)?;
+        let patched = patch_key_description(&description, &overrides)?;
         ext.extn_value = OctetString::new(patched).map_err(wrap("rewrap key description"))?;
 
         // Re-root the leaf at the keybox and re-sign the modified tbsCertificate.
@@ -313,16 +293,10 @@ pub(crate) struct PatchOverrides<'a> {
 /// / boot security levels, and any device-ID tags the leaf carries. A field present in either
 /// authorization list is replaced in place; a missing root-of-trust or level is inserted, in ascending
 /// tag order, into the tee-enforced list. Every other field is copied verbatim.
-fn patch_key_description(key_desc: &[u8], ov: &PatchOverrides) -> Result<Vec<u8>, OpError> {
-    let top = read_elem(key_desc)?;
-    if top.tag != [0x30] {
-        return Err(err("key description is not a SEQUENCE"));
-    }
-    let fields = split_elems(top.value)?;
-    if fields.len() != 8 {
-        return Err(err(&format!("key description has {} fields, expected 8", fields.len())));
-    }
-
+fn patch_key_description(
+    description: &KeyDescription<'_>,
+    ov: &PatchOverrides,
+) -> Result<Vec<u8>, OpError> {
     // (tag number, replacement element) for every field we own. The root of trust is a bare SEQUENCE
     // wrapped in its `[704] EXPLICIT` tag; the levels are integers KeyMint stores as `[tag] EXPLICIT
     // INTEGER`; the IDs are byte strings stored as `[tag] EXPLICIT OCTET STRING`.
@@ -361,8 +335,8 @@ fn patch_key_description(key_desc: &[u8], ov: &PatchOverrides) -> Result<Vec<u8>
     // leaf keeps the root of trust and levels tee-enforced, but a stray software-enforced value is
     // corrected too so no genuine value survives.
     let mut seen: Vec<u32> = Vec::new();
-    let sw = replace_in_list(read_list(fields[6])?, &overrides, &mut seen)?;
-    let mut hw = replace_in_list(read_list(fields[7])?, &overrides, &mut seen)?;
+    let sw = replace_in_list(description.software, &overrides, &mut seen)?;
+    let mut hw = replace_in_list(description.hardware, &overrides, &mut seen)?;
     for num in INSERTABLE_TAGS {
         if !seen.contains(&num) {
             if let Some((_, elem)) = overrides.iter().find(|(t, _)| *t == num) {
@@ -371,22 +345,10 @@ fn patch_key_description(key_desc: &[u8], ov: &PatchOverrides) -> Result<Vec<u8>
         }
     }
 
-    let mut body = Vec::with_capacity(key_desc.len() + 32);
-    for f in &fields[..6] {
-        body.extend_from_slice(f);
-    }
+    let mut body = description.prefix.to_vec();
     body.extend_from_slice(&tlv(&[0x30], &sw));
     body.extend_from_slice(&tlv(&[0x30], &hw));
     Ok(tlv(&[0x30], &body))
-}
-
-/// The element bytes (content) of an `AuthorizationList` SEQUENCE.
-fn read_list(field: &[u8]) -> Result<&[u8], OpError> {
-    let e = read_elem(field)?;
-    if e.tag != [0x30] {
-        return Err(err("authorization list is not a SEQUENCE"));
-    }
-    Ok(e.value)
 }
 
 /// Copy an authorization-list body, substituting any element whose context tag matches an override
@@ -519,10 +481,9 @@ fn der_uint(mut value: u32) -> Vec<u8> {
     be
 }
 
-/// One parsed TLV: its tag bytes, its value bytes, and the total encoded length (tag+len+value).
+/// One list entry: its tag and the size of its complete TLV.
 struct Elem<'a> {
     tag: &'a [u8],
-    value: &'a [u8],
     total: usize,
 }
 
@@ -562,18 +523,7 @@ fn read_elem(input: &[u8]) -> Result<Elem<'_>, OpError> {
     if end > input.len() {
         return Err(err("value runs past end of input"));
     }
-    Ok(Elem { tag, value: &input[i..end], total: end })
-}
-
-/// Split a SEQUENCE's content into its element TLV slices.
-fn split_elems(mut content: &[u8]) -> Result<Vec<&[u8]>, OpError> {
-    let mut out = Vec::new();
-    while !content.is_empty() {
-        let e = read_elem(content)?;
-        out.push(&content[..e.total]);
-        content = &content[e.total..];
-    }
-    Ok(out)
+    Ok(Elem { tag, total: end })
 }
 
 /// Encode DER length octets for a value of length `n`.
