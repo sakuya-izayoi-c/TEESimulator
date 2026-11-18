@@ -97,6 +97,10 @@ pub struct Ta {
     /// The profile's root of trust (locked/Verified) as a DER `RootOfTrust` SEQUENCE, spliced into a
     /// real leaf's attestation extension in patch mode. Identical to what generation emits.
     patch_rot: Vec<u8>,
+    /// The same value without `verifiedBootHash`, for records that declare a pre-v4
+    /// `keymasterVersion`: that version's RootOfTrust has three elements, and a fourth one is a
+    /// structural inconsistency a strict parser rejects.
+    patch_rot_no_hash: Vec<u8>,
     /// Profile OS / vendor / boot security levels. Patch mode writes these into a real leaf's
     /// attestation (see `patch_attestation`) so a patched record reports the profile's — typically
     /// fresh — patch level rather than the device's genuine, often stale, one. Generation feeds the
@@ -245,6 +249,14 @@ impl Ta {
             cfg.device_boot_locked,
             cfg.verified_boot_state,
             &cfg.verified_boot_hash,
+            true,
+        );
+        let patch_rot_no_hash = resign::build_root_of_trust(
+            &cfg.verified_boot_key,
+            cfg.device_boot_locked,
+            cfg.verified_boot_state,
+            &cfg.verified_boot_hash,
+            false,
         );
         // The whole profile this TA attests with, once, in the same hex the daemon's harvest line
         // uses, so the two can be compared directly.
@@ -293,6 +305,7 @@ impl Ta {
             inner,
             sign_info,
             patch_rot,
+            patch_rot_no_hash,
             os_version: cfg.os_version,
             os_patchlevel: cfg.os_patchlevel,
             vendor_patchlevel: cfg.vendor_patchlevel,

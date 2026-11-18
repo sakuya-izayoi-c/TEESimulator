@@ -28,6 +28,33 @@ use x509_cert::Certificate;
 /// Local (non-TA) failure code, matching `ops::ERR_UNKNOWN`.
 const ERR: i32 = -1000;
 
+/// `keymasterVersion` — field 2 of a DER `KeyDescription` — or 0 when it cannot be read.
+pub(crate) fn keymaster_version(key_desc: &[u8]) -> u32 {
+    let Ok(top) = read_elem(key_desc) else { return 0 };
+    if top.tag != [0x30] {
+        return 0;
+    }
+    let Ok(fields) = split_elems(top.value) else { return 0 };
+    let Some(field) = fields.get(2) else { return 0 };
+    let Ok(elem) = read_elem(field) else { return 0 };
+    let mut value: u32 = 0;
+    for byte in elem.value {
+        value = (value << 8) | u32::from(*byte);
+    }
+    value
+}
+
+/// `keymasterVersion` declared inside a leaf's KeyMint attestation extension, 0 when absent.
+pub(crate) fn leaf_keymaster_version(leaf: &[u8]) -> u32 {
+    let Ok(cert) = Certificate::from_der(leaf) else { return 0 };
+    cert.tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|exts| exts.iter().find(|e| e.extn_id == ATTESTATION_EXT_OID))
+        .map(|e| keymaster_version(e.extn_value.as_bytes()))
+        .unwrap_or(0)
+}
+
 /// One-line description of a DER certificate, for logs. Best effort.
 ///
 /// The serial and a public-key digest are here because every Android Keystore leaf carries the same
@@ -137,8 +164,15 @@ impl Ta {
             .iter_mut()
             .find(|e| e.extn_id == ATTESTATION_EXT_OID)
             .ok_or_else(|| err("leaf has no KeyMint attestation extension"))?;
+        // The RootOfTrust shape follows the record's own keymasterVersion: a v3 leaf carries the
+        // three-element form, a v4+ leaf the four-element form with verifiedBootHash.
+        let root_of_trust: &[u8] = if leaf_keymaster_version(leaf) >= 4 {
+            &self.patch_rot
+        } else {
+            &self.patch_rot_no_hash
+        };
         let overrides = PatchOverrides {
-            root_of_trust: &self.patch_rot,
+            root_of_trust,
             os_version: self.os_version,
             os_patchlevel: self.os_patchlevel,
             vendor_patchlevel: self.vendor_patchlevel,
@@ -206,7 +240,13 @@ impl Ta {
 // `state & 0xff` is a single ENUMERATED byte (VerifiedBootState is 0..=3); the mask makes the u8 cast
 // exact, so the sign-loss lint does not apply.
 #[allow(clippy::cast_sign_loss)]
-pub(crate) fn build_root_of_trust(vb_key: &[u8], locked: bool, state: i32, vb_hash: &[u8]) -> Vec<u8> {
+pub(crate) fn build_root_of_trust(
+    vb_key: &[u8],
+    locked: bool,
+    state: i32,
+    vb_hash: &[u8],
+    include_hash: bool,
+) -> Vec<u8> {
     // kmr-ta hashes an over-long verified-boot key (boot_info_hashed_key); mirror it.
     let key_bytes = if vb_key.len() > 32 {
         BoringSha256.hash(vb_key).map(|h| h.to_vec()).unwrap_or_else(|_| vb_key.to_vec())
@@ -217,7 +257,12 @@ pub(crate) fn build_root_of_trust(vb_key: &[u8], locked: bool, state: i32, vb_ha
     body.extend_from_slice(&tlv(&[0x04], &key_bytes)); // verifiedBootKey OCTET STRING
     body.extend_from_slice(&[0x01, 0x01, if locked { 0xff } else { 0x00 }]); // deviceLocked BOOLEAN
     body.extend_from_slice(&[0x0a, 0x01, (state & 0xff) as u8]); // verifiedBootState ENUMERATED
-    body.extend_from_slice(&tlv(&[0x04], vb_hash)); // verifiedBootHash OCTET STRING
+    // verifiedBootHash arrived with KeyMint 4: a record that declares an older keymasterVersion
+    // while carrying this fourth element is structurally inconsistent, because the reference TA for
+    // that version emits a three-element RootOfTrust.
+    if include_hash {
+        body.extend_from_slice(&tlv(&[0x04], vb_hash)); // verifiedBootHash OCTET STRING
+    }
     tlv(&[0x30], &body)
 }
 
